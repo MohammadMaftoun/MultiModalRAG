@@ -1,0 +1,207 @@
+# Step 1: Install dependencies with pinned versions to avoid torch_xla issues
+!pip uninstall -y torch torch_xla torchvision torchaudio
+!pip install torch==2.0.1 transformers==4.33.0 accelerate==0.22.0 einops==0.6.1 langchain==0.0.300 \
+xformers==0.0.21 bitsandbytes==0.41.1 sentence_transformers==2.2.2 chromadb==0.4.12 pillow==10.0.0
+
+# Step 2: Patch transformers to skip torch_xla import
+import sys
+import types
+
+# Mock the torch_xla module to avoid TPU-related imports
+sys.modules['torch_xla'] = types.ModuleType('torch_xla')
+sys.modules['torch_xla.core'] = types.ModuleType('core')
+sys.modules['torch_xla.core.xla_model'] = types.ModuleType('xla_model')
+
+# Mock is_torch_tpu_available to return False
+from transformers import utils
+def mock_is_torch_tpu_available(check_device=True):
+    return False
+utils.is_torch_tpu_available = mock_is_torch_tpu_available
+
+# Step 3: Import libraries
+from torch import cuda, bfloat16
+import torch
+import transformers
+from transformers import AutoTokenizer, CLIPProcessor, CLIPModel
+from time import time
+from langchain.llms import HuggingFacePipeline
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+import os
+from PIL import Image
+import numpy as np
+
+# Step 4: Initialize model, tokenizer, query pipeline
+local_model_path = '/kaggle/input/llama-2/pytorch/7b-chat-hf/1'
+huggingface_model_id = 'meta-llama/Llama-2-7b-chat-hf'
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+# Check if local model path exists and contains config.json
+model_id = huggingface_model_id
+if os.path.exists(local_model_path) and os.path.isfile(os.path.join(local_model_path, 'config.json')):
+    model_id = local_model_path
+    print(f"Using local model path: {model_id}")
+else:
+    print(f"Local model path {local_model_path} not found or missing config.json. Falling back to HuggingFace Hub: {huggingface_model_id}")
+    # Note: Requires HuggingFace token for gated models like LLaMA 2
+    # Set environment variable or use transformers' login
+    from huggingface_hub import login
+    # Replace with your HuggingFace token
+    os.environ["HUGGINGFACE_TOKEN"] = "your_huggingface_token_here"
+    login(token=os.environ["HUGGINGFACE_TOKEN"])
+
+# Set quantization configuration
+bnb_config = transformers.BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type='nf4',
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=bfloat16
+)
+
+# Prepare the LLaMA model and tokenizer
+try:
+    time_1 = time()
+    model_config = transformers.AutoConfig.from_pretrained(model_id)
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        config=model_config,
+        quantization_config=bnb_config,
+        device_map='auto',
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    time_2 = time()
+    print(f"Prepare model, tokenizer: {round(time_2-time_1, 3)} sec.")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    raise SystemExit("Failed to load LLaMA model. Check path or HuggingFace token.")
+
+# Define the query pipeline
+time_1 = time()
+query_pipeline = transformers.pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    torch_dtype=torch.float16,
+    device_map="auto",
+)
+time_2 = time()
+print(f"Prepare pipeline: {round(time_2-time_1, 3)} sec.")
+
+# Step 5: Initialize CLIP model for multi-modal embeddings
+clip_model_id = "openai/clip-vit-base-patch32"
+clip_model = CLIPModel.from_pretrained(clip_model_id).to(device)
+clip_processor = CLIPProcessor.from_pretrained(clip_model_id)
+
+# Step 6: Define a custom embeddings class for CLIP
+class CLIPEmbeddings:
+    def __init__(self, model, processor, device):
+        self.model = model
+        self.processor = processor
+        self.device = device
+
+    def embed_documents(self, documents):
+        embeddings = []
+        for doc in documents:
+            if hasattr(doc, 'metadata') and doc.metadata.get('type') == 'image':
+                # Process image
+                image_path = doc.metadata['source']
+                try:
+                    image = Image.open(image_path).convert('RGB')
+                    inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+                    with torch.no_grad():
+                        image_features = self.model.get_image_features(**inputs).cpu().numpy()
+                    embeddings.append(image_features.flatten())
+                except Exception as e:
+                    print(f"Error processing image {image_path}: {e}")
+                    embeddings.append(np.zeros(512))  # Fallback embedding
+            else:
+                # Process text
+                text = doc.page_content
+                inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+                with torch.no_grad():
+                    text_features = self.model.get_text_features(**inputs).cpu().numpy()
+                embeddings.append(text_features.flatten())
+        return embeddings
+
+    def embed_query(self, query):
+        inputs = self.processor(text=[query], return_tensors="pt", padding=True, truncation=True).to(self.device)
+        with torch.no_grad():
+            text_features = self.model.get_text_features(**inputs).cpu().numpy()
+        return text_features.flatten()
+
+# Initialize CLIP embeddings
+clip_embeddings = CLIPEmbeddings(clip_model, clip_processor, device)
+
+# Step 7: Ingestion of data (text and images)
+text_path = "/kaggle/input/president-bidens-state-of-the-union-2023/biden-sotu-2023-planned-official.txt"
+if os.path.exists(text_path):
+    text_loader = TextLoader(text_path, encoding="utf8")
+    text_documents = text_loader.load()
+else:
+    print(f"Text file {text_path} not found. Exiting.")
+    raise SystemExit("Text file not found.")
+
+# Split text data into chunks
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20)
+text_splits = text_splitter.split_documents(text_documents)
+
+# Load images (assume images are in a directory)
+image_dir = "/kaggle/input/images/"
+image_documents = []
+if os.path.exists(image_dir):
+    for image_file in os.listdir(image_dir):
+        if image_file.endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(image_dir, image_file)
+            image_doc = type('ImageDoc', (), {})()
+            image_doc.page_content = f"Image: {image_file}"
+            image_doc.metadata = {'source': image_path, 'type': 'image'}
+            image_documents.append(image_doc)
+else:
+    print(f"Image directory {image_dir} not found. Proceeding with text-only data.")
+
+# Combine text and image documents
+all_documents = text_splits + image_documents
+
+# Step 8: Initialize ChromaDB with multi-modal embeddings
+vectordb = Chroma.from_documents(
+    documents=all_documents,
+    embedding=clip_embeddings,
+    persist_directory="chroma_db_multimodal"
+)
+
+# Step 9: Initialize retriever and QA chain
+retriever = vectordb.as_retriever(search_kwargs={"k": 5})
+qa = RetrievalQA.from_chain_type(
+    llm=HuggingFacePipeline(pipeline=query_pipeline),
+    chain_type="stuff",
+    retriever=retriever,
+    verbose=True
+)
+
+# Step 10: Test function for RAG
+def test_rag(qa, query):
+    print(f"Query: {query}\n")
+    time_1 = time()
+    result = qa.run(query)
+    time_2 = time()
+    print(f"Inference time: {round(time_2-time_1, 3)} sec.")
+    print("\nResult: ", result)
+
+# Step 11: Test queries
+query = "What were the main topics in the State of the Union in 2023? Summarize. Keep it under 200 words."
+test_rag(qa, query)
+
+query = "Describe any charts or images related to the 2023 State of the Union address."
+test_rag(qa, query)
+
+# Step 12: Check document sources for the last query
+docs = vectordb.similarity_search(query, k=5)
+print(f"Query: {query}")
+print(f"Retrieved documents: {len(docs)}")
+for doc in docs:
+    doc_details = doc.to_json()['kwargs']
+    print("Source: ", doc_details['metadata']['source'])
+    print("Text: ", doc_details['page_content'], "\n")
