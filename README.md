@@ -15,7 +15,7 @@ It is built with a strong focus on working in restricted environments such as **
 
 - 🔍 **RAG Pipeline**: Retrieve relevant documents and generate answers with LLaMA2.
 - 🧠 **LLM**: Quantized LLaMA2-7B-Chat for lightweight deployment.
-- 🖼️ **Multimodal Embeddings**: Use CLIP to embed both images and texts.
+- 🖼️ **Multimodal Embeddings**: Use CLIP to embed images and texts.
 - 🗃️ **ChromaDB**: For storing and querying document embeddings.
 - ⚙️ **Torch XLA Patch**: Avoid TPU-related errors during import.
 
